@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+from __future__ import unicode_literals
 import datetime
 from decimal import Decimal
 import os
@@ -12,7 +14,7 @@ from django.conf import settings
 from django.test import TestCase
 from haystack import connections, reset_search_queries
 from haystack import indexes
-from haystack.inputs import AutoQuery
+from haystack.inputs import AutoQuery, AltParser, Raw
 from haystack.models import SearchResult
 from haystack.query import SearchQuerySet, RelatedSearchQuerySet, SQ
 from haystack.utils.loading import UnifiedIndex
@@ -33,7 +35,7 @@ except ImportError:
 
 def clear_solr_index():
     # Wipe it clean.
-    print 'Clearing out Solr...'
+    print('Clearing out Solr...')
     raw_solr = pysolr.Solr(settings.HAYSTACK_CONNECTIONS['default']['URL'])
     raw_solr.delete(q='*:*')
 
@@ -162,6 +164,16 @@ class SolrSpatialSearchIndex(indexes.SearchIndex, indexes.Indexable):
         return ASixthMockModel
 
 
+class SolrQuotingMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
+    text = indexes.CharField(document=True, use_template=True)
+
+    def get_model(self):
+        return MockModel
+
+    def prepare_text(self, obj):
+        return u"""Don't panic but %s has been iñtërnâtiônàlizéð""" % obj.author
+
+
 class SolrSearchBackendTestCase(TestCase):
     def setUp(self):
         super(SolrSearchBackendTestCase, self).setUp()
@@ -178,10 +190,11 @@ class SolrSearchBackendTestCase(TestCase):
         self.ui.build(indexes=[self.smmi])
         connections['default']._index = self.ui
         self.sb = connections['default'].get_backend()
+        self.sq = connections['default'].get_query()
 
         self.sample_objs = []
 
-        for i in xrange(1, 4):
+        for i in range(1, 4):
             mock = MockModel()
             mock.id = i
             mock.author = 'daniel%s' % i
@@ -319,8 +332,8 @@ class SolrSearchBackendTestCase(TestCase):
         self.assertEqual(self.sb.search('indax')['spelling_suggestion'], 'index')
         self.assertEqual(self.sb.search('Indx', spelling_query='indexy')['spelling_suggestion'], 'index')
 
-        self.assertEqual(self.sb.search('', facets=['name']), {'hits': 0, 'results': []})
-        results = self.sb.search('Index', facets=['name'])
+        self.assertEqual(self.sb.search('', facets={'name': {}}), {'hits': 0, 'results': []})
+        results = self.sb.search('Index', facets={'name': {}})
         self.assertEqual(results['hits'], 3)
         self.assertEqual(results['facets']['fields']['name'], [('daniel1', 1), ('daniel2', 1), ('daniel3', 1)])
 
@@ -334,6 +347,11 @@ class SolrSearchBackendTestCase(TestCase):
         results = self.sb.search('Index', query_facets=[('name', '[* TO e]')])
         self.assertEqual(results['hits'], 3)
         self.assertEqual(results['facets']['queries'], {'name:[* TO e]': 3})
+
+        self.assertEqual(self.sb.search('', stats={}), {'hits':0,'results':[]})
+        results = self.sb.search('*:*', stats={'name':['name']})
+        self.assertEqual(results['hits'], 3)
+        self.assertEqual(results['stats']['name']['count'], 3)
 
         self.assertEqual(self.sb.search('', narrow_queries=set(['name:daniel1'])), {'hits': 0, 'results': []})
         results = self.sb.search('Index', narrow_queries=set(['name:daniel1']))
@@ -358,6 +376,55 @@ class SolrSearchBackendTestCase(TestCase):
         # Restore.
         settings.HAYSTACK_LIMIT_TO_REGISTERED_MODELS = old_limit_to_registered_models
 
+    def test_altparser_query(self):
+        self.sb.update(self.smmi, self.sample_objs)
+
+        results = self.sb.search(AltParser('dismax', "daniel1", qf='name', mm=1).prepare(self.sq))
+        self.assertEqual(results['hits'], 1)
+
+        # This should produce exactly the same result since all we have are mockmodel instances but we simply
+        # want to confirm that using the AltParser doesn't break other options:
+        results = self.sb.search(AltParser('dismax', 'daniel1', qf='name', mm=1).prepare(self.sq),
+                                 narrow_queries=set(('django_ct:core.mockmodel', )))
+        self.assertEqual(results['hits'], 1)
+
+        results = self.sb.search(AltParser('dismax', '+indexed +daniel1', qf='text name', mm=1).prepare(self.sq))
+        self.assertEqual(results['hits'], 1)
+
+        self.sq.add_filter(SQ(name=AltParser('dismax', 'daniel1', qf='name', mm=1)))
+        self.sq.add_filter(SQ(text='indexed'))
+
+        new_q = self.sq._clone()
+        new_q._reset()
+
+        new_q.add_filter(SQ(name='daniel1'))
+        new_q.add_filter(SQ(text=AltParser('dismax', 'indexed', qf='text')))
+
+        results = new_q.get_results()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].id, 'core.mockmodel.1')
+
+    def test_raw_query(self):
+        self.sb.update(self.smmi, self.sample_objs)
+
+        # Ensure that the raw bits have proper parenthesis.
+        new_q = self.sq._clone()
+        new_q._reset()
+        new_q.add_filter(SQ(content=Raw("{!dismax qf='title^2 text' mm=1}my query")))
+
+        results = new_q.get_results()
+        self.assertEqual(len(results), 0)
+
+    def test_altparser_quoting(self):
+        test_objs = [
+            MockModel(id=1, author="Foo d'Bar", pub_date=datetime.date.today()),
+            MockModel(id=2, author="Baaz Quuz", pub_date=datetime.date.today()),
+        ]
+        self.sb.update(SolrQuotingMockSearchIndex(), test_objs)
+
+        results = self.sb.search(AltParser('dismax', "+don't +quuz", qf='text').prepare(self.sq))
+        self.assertEqual(results['hits'], 1)
+
     def test_more_like_this(self):
         self.sb.update(self.smmi, self.sample_objs)
         self.assertEqual(self.raw_solr.search('*:*').hits, 3)
@@ -373,21 +440,7 @@ class SolrSearchBackendTestCase(TestCase):
         (content_field_name, fields) = self.sb.build_schema(old_ui.all_searchfields())
         self.assertEqual(content_field_name, 'text')
         self.assertEqual(len(fields), 4)
-        self.assertEqual(fields, [
-            {
-                'indexed': 'true',
-                'type': 'text_en',
-                'stored': 'true',
-                'field_name': 'text',
-                'multi_valued': 'false'
-            },
-            {
-                'indexed': 'true',
-                'type': 'date',
-                'stored': 'true',
-                'field_name': 'pub_date',
-                'multi_valued': 'false'
-            },
+        self.assertEqual(sorted(fields, key=lambda x: x['field_name']), [
             {
                 'indexed': 'true',
                 'type': 'text_en',
@@ -401,7 +454,21 @@ class SolrSearchBackendTestCase(TestCase):
                 'stored': 'true',
                 'type': 'string',
                 'multi_valued': 'false'
-            }
+            },
+            {
+                'indexed': 'true',
+                'type': 'date',
+                'stored': 'true',
+                'field_name': 'pub_date',
+                'multi_valued': 'false'
+            },
+            {
+                'indexed': 'true',
+                'type': 'text_en',
+                'stored': 'true',
+                'field_name': 'text',
+                'multi_valued': 'false'
+            },
         ])
 
         ui = UnifiedIndex()
@@ -545,7 +612,7 @@ class FailedSolrSearchBackendTestCase(TestCase):
     def test_all_cases(self, mock_send_request, mock_log):
         self.sample_objs = []
 
-        for i in xrange(1, 4):
+        for i in range(1, 4):
             mock = MockModel()
             mock.id = i
             mock.author = 'daniel%s' % i
@@ -668,7 +735,7 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         global lssqstc_all_loaded
 
         if lssqstc_all_loaded is None:
-            print 'Reloading data...'
+            print('Reloading data...')
             lssqstc_all_loaded = True
 
             # Wipe it clean.
@@ -694,7 +761,7 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         self.assertEqual(len(connections['default'].queries), 0)
         sqs = self.sqs.all()
         results = [int(result.pk) for result in sqs]
-        self.assertEqual(results, range(1, 24))
+        self.assertEqual(results, list(range(1, 24)))
         self.assertEqual(len(connections['default'].queries), 3)
 
     def test_slice(self):
@@ -727,7 +794,7 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         reset_search_queries()
         self.assertEqual(len(connections['default'].queries), 0)
         results = [int(result.pk) for result in results._manual_iter()]
-        self.assertEqual(results, range(1, 24))
+        self.assertEqual(results, list(range(1, 24)))
         self.assertEqual(len(connections['default'].queries), 3)
 
     def test_fill_cache(self):
@@ -797,6 +864,11 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         self.assertEqual(sqs.query.build_query(), u'("pants\\:rule")')
         self.assertEqual(len(sqs), 0)
 
+        sqs = self.sqs.auto_query('Canon+PowerShot+ELPH+(Black)')
+        self.assertEqual(sqs.query.build_query(), u'Canon\\+PowerShot\\+ELPH\\+\\(Black\\)')
+        sqs = sqs.filter(tags__in=['cameras', 'electronics'])
+        self.assertEqual(len(sqs), 0)
+
     # Regressions
 
     def test_regression_proper_start_offsets(self):
@@ -839,12 +911,12 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         sqs = sqs.load_all_queryset(MockModel, MockModel.objects.filter(id__gt=1))
         self.assertTrue(isinstance(sqs, SearchQuerySet))
         self.assertEqual(len(sqs._load_all_querysets), 1)
-        self.assertEqual([obj.object.id for obj in sqs], range(2, 24))
+        self.assertEqual([obj.object.id for obj in sqs], list(range(2, 24)))
 
         sqs = sqs.load_all_queryset(MockModel, MockModel.objects.filter(id__gt=10))
         self.assertTrue(isinstance(sqs, SearchQuerySet))
         self.assertEqual(len(sqs._load_all_querysets), 1)
-        self.assertEqual([obj.object.id for obj in sqs], range(11, 24))
+        self.assertEqual([obj.object.id for obj in sqs], list(range(11, 24)))
         self.assertEqual([obj.object.id for obj in sqs[10:20]], [21, 22, 23])
 
     def test_related_iter(self):
@@ -852,7 +924,7 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         self.assertEqual(len(connections['default'].queries), 0)
         sqs = self.rsqs.all()
         results = [int(result.pk) for result in sqs]
-        self.assertEqual(results, range(1, 24))
+        self.assertEqual(results, list(range(1, 24)))
         self.assertEqual(len(connections['default'].queries), 4)
 
     def test_related_slice(self):
@@ -880,7 +952,7 @@ class LiveSolrSearchQuerySetTestCase(TestCase):
         reset_search_queries()
         self.assertEqual(len(connections['default'].queries), 0)
         results = [int(result.pk) for result in results._manual_iter()]
-        self.assertEqual(results, range(1, 24))
+        self.assertEqual(results, list(range(1, 24)))
         self.assertEqual(len(connections['default'].queries), 4)
 
     def test_related_fill_cache(self):
@@ -1199,7 +1271,7 @@ class SolrBoostBackendTestCase(TestCase):
 
         self.sample_objs = []
 
-        for i in xrange(1, 5):
+        for i in range(1, 5):
             mock = AFourthMockModel()
             mock.id = i
 
