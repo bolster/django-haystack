@@ -174,6 +174,8 @@ A third option is to develop a custom ``QueuedSignalProcessor`` that, much like
 updates/deletes. Then writing a management command to consume these messages
 in batches, yielding a nice compromise between the previous two options.
 
+For more information see :doc:`signal_processors`.
+
 .. note::
 
     Haystack doesn't ship with a ``QueuedSignalProcessor`` largely because there is
@@ -566,11 +568,11 @@ The ``ModelSearchIndex`` class allows for automatic generation of a
 
 With the exception of the automated introspection, it is a ``SearchIndex``
 class, so all notes above pertaining to ``SearchIndexes`` apply. As with the
-``ModelForm`` class in Django, it employs an inner class called ``Meta``,
-which should either contain a ``pass`` to include all fields, a ``fields`` list
-to specify a whitelisted set of fields or ``excludes`` to prevent certain fields
-from appearing in the class. Unlike ``ModelForm``, you should **NOT** specify
-a ``model`` attribute, as that is already handled when registering the class.
+``ModelForm`` class in Django, it employs an inner class called ``Meta``, which
+should contain a ``model`` attribute. By default all non-relational model
+fields are included as search fields on the index, but fields can be restricted
+by way of a ``fields`` whitelist, or excluded with an ``excludes`` list, to
+prevent certain fields from appearing in the class.
 
 In addition, it adds a `text` field that is the ``document=True`` field and
 has `use_template=True` option set, just like the ``BasicSearchIndex``.

@@ -1,16 +1,19 @@
 from __future__ import unicode_literals
+
 import warnings
+
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
 from django.utils import six
-from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query, EmptyResults
-from haystack.constants import ID, DJANGO_CT, DJANGO_ID
+
+from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, EmptyResults, log_query
+from haystack.constants import DJANGO_CT, DJANGO_ID, ID
 from haystack.exceptions import MissingDependency, MoreLikeThisError
-from haystack.inputs import PythonData, Clean, Exact, Raw
+from haystack.inputs import Clean, Exact, PythonData, Raw
 from haystack.models import SearchResult
-from haystack.utils import get_identifier
 from haystack.utils import log as logging
+from haystack.utils import get_identifier, get_model_ct
 
 try:
     from pysolr import Solr, SolrError
@@ -40,7 +43,7 @@ class SolrSearchBackend(BaseSearchBackend):
         if not 'URL' in connection_options:
             raise ImproperlyConfigured("You must specify a 'URL' in your settings for connection '%s'." % connection_alias)
 
-        self.conn = Solr(connection_options['URL'], timeout=self.timeout)
+        self.conn = Solr(connection_options['URL'], timeout=self.timeout, **connection_options.get('KWARGS', {}))
         self.log = logging.getLogger('haystack')
 
     def update(self, index, iterable, commit=True):
@@ -78,7 +81,7 @@ class SolrSearchBackend(BaseSearchBackend):
         try:
             kwargs = {
                 'commit': commit,
-                ID: solr_id
+                'id': solr_id
             }
             self.conn.delete(**kwargs)
         except (IOError, SolrError) as e:
@@ -96,12 +99,13 @@ class SolrSearchBackend(BaseSearchBackend):
                 models_to_delete = []
 
                 for model in models:
-                    models_to_delete.append("%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
+                    models_to_delete.append("%s:%s" % (DJANGO_CT, get_model_ct(model)))
 
                 self.conn.delete(q=" OR ".join(models_to_delete), commit=commit)
 
-            # Run an optimize post-clear. http://wiki.apache.org/solr/FAQ#head-9aafb5d8dff5308e8ea4fcf4b71f19f029c4bb99
-            self.conn.optimize()
+            if commit:
+                # Run an optimize post-clear. http://wiki.apache.org/solr/FAQ#head-9aafb5d8dff5308e8ea4fcf4b71f19f029c4bb99
+                self.conn.optimize()
         except (IOError, SolrError) as e:
             if not self.silently_fail:
                 raise
@@ -215,7 +219,7 @@ class SolrSearchBackend(BaseSearchBackend):
             limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
 
         if models and len(models):
-            model_choices = sorted(['%s.%s' % (model._meta.app_label, model._meta.module_name) for model in models])
+            model_choices = sorted(get_model_ct(model) for model in models)
         elif limit_to_registered_models:
             # Using narrow queries, limit the results to only models handled
             # with the current routers.
@@ -297,7 +301,7 @@ class SolrSearchBackend(BaseSearchBackend):
             limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
 
         if models and len(models):
-            model_choices = sorted(['%s.%s' % (model._meta.app_label, model._meta.module_name) for model in models])
+            model_choices = sorted(get_model_ct(model) for model in models)
         elif limit_to_registered_models:
             # Using narrow queries, limit the results to only models handled
             # with the current routers.
@@ -507,25 +511,6 @@ class SolrSearchQuery(BaseSearchQuery):
     def matching_all_fragment(self):
         return '*:*'
 
-    def add_spatial(self, lat, lon, sfield, distance, filter='bbox'):
-        """Adds spatial query parameters to search query"""
-        kwargs = {
-            'lat': lat,
-            'long': long,
-            'sfield': sfield,
-            'distance': distance,
-        }
-        self.spatial_query.update(kwargs)
-
-    def add_order_by_distance(self, lat, long, sfield):
-        """Orders the search result by distance from point."""
-        kwargs = {
-            'lat': lat,
-            'long': long,
-            'sfield': sfield,
-        }
-        self.order_by_distance.update(kwargs)
-
     def build_query_fragment(self, field, filter_type, value):
         from haystack import connections
         query_frag = ''
@@ -689,6 +674,9 @@ class SolrSearchQuery(BaseSearchQuery):
         """Builds and executes the query. Returns a list of search results."""
         final_query = self.build_query()
         search_kwargs = self.build_params(spelling_query, **kwargs)
+
+        if kwargs:
+            search_kwargs.update(kwargs)
 
         results = self.backend.search(final_query, **search_kwargs)
         self._results = results.get('results', [])

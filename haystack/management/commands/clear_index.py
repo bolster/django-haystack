@@ -4,6 +4,7 @@ from optparse import make_option
 import sys
 
 from django.core.management.base import BaseCommand
+from django.utils import six
 
 
 class Command(BaseCommand):
@@ -17,6 +18,9 @@ class Command(BaseCommand):
             help='Update only the named backend (can be used multiple times). '
                  'By default all backends will be updated.'
         ),
+        make_option('--nocommit', action='store_false', dest='commit',
+            default=True, help='Will pass commit=False to the backend.'
+        ),
     )
     option_list = BaseCommand.option_list + base_options
 
@@ -24,6 +28,7 @@ class Command(BaseCommand):
         """Clears out the search index completely."""
         from haystack import connections
         self.verbosity = int(options.get('verbosity', 1))
+        self.commit = options.get('commit', True)
 
         using = options.get('using')
         if not using:
@@ -34,7 +39,7 @@ class Command(BaseCommand):
             print("WARNING: This will irreparably remove EVERYTHING from your search index in connection '%s'." % "', '".join(using))
             print("Your choices after this are to restore from backups or rebuild via the `rebuild_index` command.")
 
-            yes_or_no = raw_input("Are you sure you wish to continue? [y/N] ")
+            yes_or_no = six.moves.input("Are you sure you wish to continue? [y/N] ")
             print
 
             if not yes_or_no.lower().startswith('y'):
@@ -46,7 +51,7 @@ class Command(BaseCommand):
 
         for backend_name in using:
             backend = connections[backend_name].get_backend()
-            backend.clear()
+            backend.clear(commit=self.commit)
 
         if self.verbosity >= 1:
             print("All documents removed.")
